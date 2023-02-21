@@ -25,6 +25,10 @@ cdef extern from "math.h":
     double fmax(double x, double y) nogil
     double isinf(long double) nogil
     double INFINITY
+    double cos(double x) nogil
+    double sin(double x) nogil
+    double acosh(double x) nogil
+    double cosh(double x) nogil
 
 
 cpdef double[:, ::1] compute_gaussian_perplexity(
@@ -167,6 +171,33 @@ cpdef tuple estimate_positive_gradient_nn(
         free(diff)
 
     return sum_P, kl_divergence
+
+# cdef inline double distance_polar(double r, double phi, double r2, double phi2) nogil:
+#     cdef:
+#         double u0 = r * cos(phi)
+#         double u1 = r * sin(phi)
+#
+#         double v0 = r2 * cos(phi2)
+#         double v1 = r2 * sin(phi2)
+#         double uv2 = ((u0 - v0) * (u0 - v0)) + ((u1 - v1) * (u1 - v1))
+#         double u2 = u0 * u0 + u1 * u1
+#         double v2 = v0 * v0 + v1 * v1
+#         double alpha = 1. - max(u2, EPSILON)
+#         double beta = 1. - max(v2, EPSILON)
+#         double result = acosh( 1. + 2. * uv2 / ( alpha * beta ) )
+#
+#     return result
+
+cdef inline double distance(double u1, double u2, double v1, double v2) nogil:
+    cdef:
+        double uv2 = ((u1 - v1) * (u1 - v1)) + ((u2 - v2) * (u2 - v2))
+        double u_sq = u1 * u1 + u2 * u2
+        double v_sq = v1 * v1 + v2 * v2
+        double alpha = 1. - max(u_sq, EPSILON)
+        double beta = 1. - max(v_sq, EPSILON)
+        double result = acosh( 1. + 2. * uv2 / ( alpha * beta ) )
+
+    return result
 
 
 cpdef double estimate_negative_gradient_bh(

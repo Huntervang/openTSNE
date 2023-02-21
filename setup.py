@@ -10,6 +10,7 @@ from distutils.sysconfig import customize_compiler
 from os.path import join
 
 import setuptools
+from Cython.Build import cythonize
 from setuptools import setup, Extension
 
 try:
@@ -311,6 +312,6 @@ setup(
         "hnsw": "hnswlib~=0.4.0",
         "pynndescent": "pynndescent~=0.5.0",
     },
-    ext_modules=extensions,
+    ext_modules=cythonize(extensions, gdb_debug=True),
     cmdclass={"build_ext": CythonBuildExt, "convert_notebooks": ConvertNotebooksToDocs},
 )
