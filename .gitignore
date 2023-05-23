@@ -8,3 +8,9 @@ dist/
 .ipynb_checkpoints/
 .DS_STORE
 *.cpp
+.vs/
+hypertsne/
+*.pyd
+cython_debug/
+cygdb.log
+commands.txt
