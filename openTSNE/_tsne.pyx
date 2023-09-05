@@ -8,28 +8,150 @@ cimport numpy as np
 import numpy as np
 from cython.parallel import prange, parallel
 from cpython.mem cimport PyMem_Malloc, PyMem_Free
-from libc.stdlib cimport malloc, free
+from libc.math cimport sqrt, log, acosh, cosh, cos, sin, M_PI, atan2, tanh, isnan, fabs, fmin, fmax, isinf, INFINITY, exp
 
 from .quad_tree cimport QuadTree, Node, is_duplicate
 from ._matrix_mul.matrix_mul cimport matrix_multiply_fft_1d, matrix_multiply_fft_2d
 
 
-cdef double EPSILON = np.finfo(np.float64).eps
+cdef double MACHINE_EPSILON = np.finfo(np.float64).eps
+cdef double EPSILON = 1e-5
+cdef double BOUNDARY = 1 - EPSILON
+cdef double MAX_TANH = 15.0
 
+cdef double clamp(double n, double lower, double upper) nogil:
+    cdef double t = lower if n < lower else n
+    return upper if t > upper else t
 
-cdef extern from "math.h":
-    double sqrt(double x) nogil
-    double log(double x) nogil
-    double exp(double x) nogil
-    double fabs(double x) nogil
-    double fmax(double x, double y) nogil
-    double isinf(long double) nogil
-    double INFINITY
-    double cos(double x) nogil
-    double sin(double x) nogil
-    double acosh(double x) nogil
-    double cosh(double x) nogil
+cdef double distance_mem(double[:] u, double[:] v) nogil:
+    return distance(u[0], u[1], v[0], v[1])
 
+cdef double distance_pointer(double* u, double* v) nogil:
+    return distance(u[0], u[1], v[0], v[1])
+
+cdef double distance_grad_mem(double[:] u, double[:] v, int ax) nogil:
+    return distance_grad(u[0], u[1], v[0], v[1], ax)
+
+cdef double distance_grad_pointer(double* u, double* v, int ax) nogil:
+    return distance_grad(u[0], u[1], v[0], v[1], ax)
+
+cpdef double distance(double u0, double u1, double v0, double v1) nogil:
+    if fabs(u0 - v0) <= EPSILON and fabs(u1 - v1) <= EPSILON:
+        return 0.
+
+    cdef:
+        double uv2 = ((u0 - v0) * (u0 - v0)) + ((u1 - v1) * (u1 - v1))
+        double u_sq = clamp(u0 * u0 + u1 * u1, 0, BOUNDARY)
+        double v_sq = clamp(v0 * v0 + v1 * v1, 0, BOUNDARY)
+        double alpha = 1. - u_sq
+        double beta = 1. - v_sq
+        double result = acosh( 1. + 2. * uv2 / ( alpha * beta ) )
+
+    return result
+
+cdef double distance_grad(double u0, double u1, double v0, double v1, int ax) nogil:
+    if fabs(u0 - v0) <= EPSILON and fabs(u1 - v1) <= EPSILON:
+        return 0.
+
+    cdef:
+        double a = u0 - v0
+        double b = u1 - v1
+        double uv2 = a * a + b * b
+
+        double u_sq = clamp(u0 * u0 + u1 * u1, 0, BOUNDARY)
+        double v_sq = clamp(v0 * v0 + v1 * v1, 0, BOUNDARY)
+        double alpha = 1. - u_sq
+        double beta = 1. - v_sq
+
+        double gamma = 1. + (2. / (alpha * beta)) * uv2
+        double shared_scalar = 4. / fmax(beta * sqrt((gamma * gamma) - 1.), MACHINE_EPSILON)
+
+        double u_scalar = (v_sq - 2. * (u0 * v0 + u1 * v1) + 1.) / (alpha * alpha)
+        double v_scalar = 1. / alpha
+
+    if ax == 0:
+        return shared_scalar * (u_scalar * u0 - v_scalar * v0)
+    else:
+        return shared_scalar * (u_scalar * u1 - v_scalar * v1)
+
+cdef void exp_map_single(double* x, double* v, double* res):
+    cdef double x_norm_sq, metric, v_norm, v_scalar
+    cdef double* y = <double*> PyMem_Malloc(sizeof(double) * 2)
+
+    x_norm_sq = clamp(x[0] ** 2 + x[1] ** 2, 0, BOUNDARY)
+
+    metric = 2. / (1. - x_norm_sq)
+    v_norm = sqrt(v[0] ** 2 + v[1] ** 2)
+
+    v_scalar = tanh(clamp((metric * v_norm) / 2., -MAX_TANH, MAX_TANH))
+
+    for j in range(2):
+        y[j] = (v[j] / v_norm) * v_scalar
+
+    mobius_addition(x, y, res)
+    PyMem_Free(y)
+
+cpdef void exp_map(double[:, :] x, double[:, :] v, double[:, :] out, int num_threads):
+    cdef double* exp_map_res = <double*> PyMem_Malloc(sizeof(double) * 2)
+
+    for i in range(x.shape[0]):
+        exp_map_single(&x[i, 0], &v[i, 0], exp_map_res)
+
+        for j in range(2):
+            out[i, j] = exp_map_res[j]
+
+    PyMem_Free(exp_map_res)
+
+cdef void mobius_addition(double* x, double* y, double* res) nogil:
+    cdef double y_norm_sq, x_norm_sq, x_scalar, y_scalar, r_term, denominator
+
+    x_norm_sq = clamp(x[0] ** 2 + x[1] ** 2, 0, BOUNDARY)
+    y_norm_sq = y[0] ** 2 + y[1] ** 2
+
+    r_term = 1. + 2. * (x[0] * y[0] + x[1] * y[1])
+
+    x_scalar = (r_term + y_norm_sq)
+    y_scalar = (1. - x_norm_sq)
+
+    denominator = r_term + x_norm_sq * y_norm_sq
+
+    for i in range(2):
+        res[i] = (x_scalar * x[i] + y_scalar * y[i]) / denominator
+
+# cdef void log_map_single(double* x, double* y, double* res) nogil:
+#     cdef double x_norm_sq, metric, y_scalar
+#
+#     x_norm_sq = clamp(x[0] ** 2 + x[1] ** 2, 0, BOUNDARY)
+#
+#     metric = 2. / (1. - x_norm_sq)
+#
+#     cdef double* u = <double*> PyMem_Malloc(sizeof(double) * 2)
+#     for j in range(2):
+#         u[j] = -x[j]
+#
+#     cdef double* mobius_res = <double *> PyMem_Malloc(sizeof(double) * 2)
+#     mobius_addition(u, y, mobius_res)
+#
+#     free(u)
+#
+#     mob_add_norm = sqrt(mobius_res[0] ** 2 + mobius_res[1] ** 2)
+#     y_scalar = atanh(fmin(mob_add_norm, 1. - EPSILON))
+#
+#     for j in range(2):
+#         res[j] = (2. / metric) * y_scalar * (mobius_res[j] / mob_add_norm)
+#
+#     PyMem_Free(mobius_res)
+#
+# cpdef void log_map(double[:, :] x, double[:, :] y, double[:, :] out, int num_threads) nogil:
+#     cdef double* log_map_res = <double*> PyMem_Malloc(sizeof(double) * 2)
+#
+#     for i in range(x.shape[0]):
+#         log_map_single(&x[i, 0], &y[i, 0], log_map_res)
+#
+#         for j in range(2):
+#             out[i, j] = log_map_res[j]
+#
+#     PyMem_Free(log_map_res)
 
 cpdef double[:, ::1] compute_gaussian_perplexity(
     double[:, :] distances,
@@ -131,24 +253,14 @@ cpdef tuple estimate_positive_gradient_nn(
         dof = 1e-8
 
     with nogil, parallel(num_threads=num_threads):
-        # Use `malloc` here instead of `PyMem_Malloc` because we're in a
-        # `nogil` clause and we won't be allocating much memory
-        diff = <double *>malloc(n_dims * sizeof(double))
-        if not diff:
-            with gil:
-                raise MemoryError()
-
         for i in prange(n_samples, schedule="guided"):
             # Iterate over all the neighbors `j` and sum up their contribution
             for k in range(indptr[i], indptr[i + 1]):
                 j = indices[k]
                 p_ij = P_data[k]
-                # Compute the direction of the points attraction and the
-                # squared euclidean distance between the points
-                d_ij = 0
-                for d in range(n_dims):
-                    diff[d] = embedding[i, d] - reference_embedding[j, d]
-                    d_ij = d_ij + diff[d] * diff[d]
+
+                d_ij = distance_mem(embedding[i], reference_embedding[j])
+                d_ij = d_ij * d_ij
 
                 if dof != 1:
                     # No need exp by dof here because the terms cancel out
@@ -158,7 +270,7 @@ cpdef tuple estimate_positive_gradient_nn(
 
                 # Compute F_{attr} of point `j` on point `i`
                 for d in range(n_dims):
-                    gradient[i, d] = gradient[i, d] + q_ij * p_ij * diff[d]
+                    gradient[i, d] = q_ij * p_ij * distance_grad_mem(embedding[i], reference_embedding[j], d)
 
                 # Evaluating the following expressions can slow things down
                 # considerably if evaluated every iteration. Note that the q_ij
@@ -168,37 +280,7 @@ cpdef tuple estimate_positive_gradient_nn(
                     sum_P += p_ij
                     kl_divergence += p_ij * log((p_ij / (q_ij + EPSILON)) + EPSILON)
 
-        free(diff)
-
     return sum_P, kl_divergence
-
-# cdef inline double distance_polar(double r, double phi, double r2, double phi2) nogil:
-#     cdef:
-#         double u0 = r * cos(phi)
-#         double u1 = r * sin(phi)
-#
-#         double v0 = r2 * cos(phi2)
-#         double v1 = r2 * sin(phi2)
-#         double uv2 = ((u0 - v0) * (u0 - v0)) + ((u1 - v1) * (u1 - v1))
-#         double u2 = u0 * u0 + u1 * u1
-#         double v2 = v0 * v0 + v1 * v1
-#         double alpha = 1. - max(u2, EPSILON)
-#         double beta = 1. - max(v2, EPSILON)
-#         double result = acosh( 1. + 2. * uv2 / ( alpha * beta ) )
-#
-#     return result
-
-cdef inline double distance(double u1, double u2, double v1, double v2) nogil:
-    cdef:
-        double uv2 = ((u1 - v1) * (u1 - v1)) + ((u2 - v2) * (u2 - v2))
-        double u_sq = u1 * u1 + u2 * u2
-        double v_sq = v1 * v1 + v2 * v2
-        double alpha = 1. - max(u_sq, EPSILON)
-        double beta = 1. - max(v_sq, EPSILON)
-        double result = acosh( 1. + 2. * uv2 / ( alpha * beta ) )
-
-    return result
-
 
 cpdef double estimate_negative_gradient_bh(
     QuadTree tree,
@@ -261,26 +343,27 @@ cdef void _estimate_negative_gradient_single(
         return
 
     cdef:
-        double distance = EPSILON
+        double dist = EPSILON
         double q_ij, tmp
         Py_ssize_t d
 
     # Compute the squared euclidean disstance in the embedding space from the
     # new point to the center of mass
-    for d in range(node.n_dims):
-        tmp = node.center_of_mass[d] - point[d]
-        distance += (tmp * tmp)
+    tmp = distance_pointer(node.center_of_mass, point)
+    dist = (tmp * tmp)
 
     # Degrees of freedom cannot be negative
     if dof <= 0:
         dof = 1e-8
 
+    # TODO: check sqrt
     # Check whether we can use this node as a summary
-    if node.is_leaf or node.length / sqrt(distance) < theta:
+    if node.is_leaf:
+    # if node.is_leaf or node.length / sqrt(dist) < theta:
         if dof != 1:
-            q_ij = 1 / (1 + distance / dof) ** dof
+            q_ij = 1 / (1 + dist / dof) ** dof
         else:
-            q_ij = 1 / (1 + distance)
+            q_ij = 1 / (1 + dist)
 
         sum_Q[0] += node.num_points * q_ij
 
@@ -292,7 +375,8 @@ cdef void _estimate_negative_gradient_single(
             q_ij = q_ij * q_ij
 
         for d in range(node.n_dims):
-            gradient[d] -= node.num_points * q_ij * (point[d] - node.center_of_mass[d])
+            # TODO: check minus
+            gradient[d] -= node.num_points * q_ij * distance_grad_pointer(point, node.center_of_mass, d)
 
         return
 

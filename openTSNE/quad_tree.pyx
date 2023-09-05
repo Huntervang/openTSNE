@@ -35,11 +35,15 @@ References
 """
 import numpy as np
 from cpython.mem cimport PyMem_Malloc, PyMem_Free
+from libc.math cimport sqrt, log, acosh, cosh, cos, sin, M_PI, atan, atan2, acos, tanh
 
+DEF RANGE = 0
+DEF ANGLE = 1
+DEF AREA_SPLIT = 0
+DEF PI = 3.14159265358979323846264338327950288
 
 cdef extern from "math.h":
     double fabs(double x) nogil
-
 
 cdef void init_node(Node * node, Py_ssize_t n_dim, double * center, double length):
     node.n_dims = n_dim
@@ -143,22 +147,91 @@ cdef void delete_node(Node * node):
         delete_node(&node.children[i])
     PyMem_Free(node.children)
 
+cdef double distance(double u1, double u2, double v1, double v2) nogil:
+    cdef:
+        double uv2 = ((u1 - v1) * (u1 - v1)) + ((u2 - v2) * (u2 - v2))
+        double u_sq = u1 * u1 + u2 * u2
+        double v_sq = v1 * v1 + v2 * v2
+        double alpha = 1. - max(u_sq, EPSILON)
+        double beta = 1. - max(v_sq, EPSILON)
+        double result = acosh( 1. + 2. * uv2 / ( alpha * beta ) )
+
+    return result
+
+cdef double distance_mem(double[:] u, double[:] v) nogil:
+    return distance(u[0], u[1], v[0], v[1])
+
+cdef double distance_pointer(double* u, double* v) nogil:
+    return distance(u[0], u[1], v[0], v[1])
+
+cdef double er_to_hr(double er) nogil:
+    return acosh(1 + 2 * er * er / (1 - er * er + EPSILON))
+
+cdef double hr_to_er(double hr) nogil:
+    cdef double ch = cosh(hr)
+
+    return sqrt((ch - 1) / (ch + 1))
+
+cdef double mid_range(double min_r, double max_r) nogil:
+    cdef:
+        # TODO: check alpha
+        double alpha = 1.
+        double res = cosh(alpha * er_to_hr(max_r)) + cosh(alpha * er_to_hr(min_r))
+
+    if AREA_SPLIT:
+        return hr_to_er(acosh(res / 2) / alpha)
+    else:
+        return (min_r + max_r) / 2
+
+
+# cdef double* point_to_polar(double* point) nogil:
+#     cdef:
+#         double[2] polar_point
+#
+#     polar_point[RANGE] = sqrt(point[0] ** 2 + point[1] ** 2)
+#     polar_point[ANGLE] = atan2(point[1], point[0])
+#
+#     polar_point[ANGLE] = polar_point[ANGLE] if polar_point[ANGLE] > 0 else polar_point[ANGLE] + 2 * PI
+#
+#     return polar_point
 
 cdef class QuadTree:
     def __init__(self, double[:, ::1] data):
         cdef:
             Py_ssize_t n_dim = data.shape[1]
-            double[:] x_min = np.min(data, axis=0)
-            double[:] x_max = np.max(data, axis=0)
+            double[:] x_min = np.zeros(n_dim)
+            double[:] x_max = np.zeros(n_dim)
 
             double[:] center = np.zeros(n_dim)
             double length = 0
             Py_ssize_t d
 
-        for d in range(n_dim):
-            center[d] = (x_max[d] + x_min[d]) / 2
-            if x_max[d] - x_min[d] > length:
-                length = x_max[d] - x_min[d]
+            double r = 0
+            Py_ssize_t i
+
+        x_min[RANGE] = 1.
+        x_max[RANGE] = 0.
+
+        for i in range(data.shape[0]):
+            r = sqrt(data[i, 0] ** 2 + data[i, 1] ** 2)
+
+            if r < x_min[RANGE]:
+                x_min[RANGE] = r
+
+            if r > x_max[RANGE]:
+                x_max[RANGE] = r
+
+        x_min[ANGLE] = 0.
+        x_max[ANGLE] = 2. * PI
+
+        center[ANGLE] = (x_max[ANGLE] + x_min[ANGLE]) / 2.
+        # TODO: mid range
+        center[RANGE] = (x_max[RANGE] + x_min[RANGE]) / 2.
+
+        # for d in range(n_dim):
+        #     center[d] = (x_max[d] + x_min[d]) / 2
+
+        length = distance_mem(x_min, x_max)
 
         self.root = Node()
         init_node(&self.root, n_dim, &center[0], length)

@@ -1,3 +1,4 @@
+import ctypes
 import inspect
 import logging
 import multiprocessing
@@ -10,6 +11,7 @@ from sklearn.base import BaseEstimator
 
 from openTSNE import _tsne
 from openTSNE import initialization as initialization_scheme
+from openTSNE._tsne import exp_map
 from openTSNE.affinity import Affinities, MultiscaleMixture
 from openTSNE.quad_tree import QuadTree
 from openTSNE import utils
@@ -1818,23 +1820,30 @@ class gradient_descent:
                         P /= exaggeration
                     raise OptimizationInterrupt(error=error, final_embedding=embedding)
 
-            # Update the embedding using the gradient
-            grad_direction_flipped = np.sign(update) != np.sign(gradient)
-            grad_direction_same = np.invert(grad_direction_flipped)
-            self.gains[grad_direction_flipped] += 0.2
-            self.gains[grad_direction_same] = (
-                self.gains[grad_direction_same] * 0.8 + min_gain
-            )
-            update = momentum * update - learning_rate * self.gains * gradient
+            res = np.empty(embedding.shape, dtype=ctypes.c_double)
+            exp_map(embedding, (-learning_rate * gradient), res, n_jobs)
+            embedding = embedding * 0 + res
 
-            # Clip the update sizes
-            if max_step_norm is not None:
-                update_norms = np.linalg.norm(update, axis=1, keepdims=True)
-                mask = update_norms.squeeze() > max_step_norm
-                update[mask] /= update_norms[mask]
-                update[mask] *= max_step_norm
+            # TODO
+            momentum = False
+            if momentum:
+                # Update the embedding using the gradient
+                grad_direction_flipped = np.sign(update) != np.sign(gradient)
+                grad_direction_same = np.invert(grad_direction_flipped)
+                self.gains[grad_direction_flipped] += 0.2
+                self.gains[grad_direction_same] = (
+                    self.gains[grad_direction_same] * 0.8 + min_gain
+                )
+                update = momentum * update - learning_rate * self.gains * gradient
 
-            embedding += update
+                # Clip the update sizes
+                if max_step_norm is not None:
+                    update_norms = np.linalg.norm(update, axis=1, keepdims=True)
+                    mask = update_norms.squeeze() > max_step_norm
+                    update[mask] /= update_norms[mask]
+                    update[mask] *= max_step_norm
+
+                embedding += update
 
             # Zero-mean the embedding only if we're not adding new data points,
             # otherwise this will reset point positions
@@ -1853,7 +1862,7 @@ class gradient_descent:
                 # Zero out the momentum terms for the points that hit the boundary
                 self.gains[~mask] = 0
 
-            if verbose and (iteration + 1) % 50 == 0:
+            if verbose and (iteration + 1) % 1 == 0:
                 stop_time = time()
                 print("Iteration %4d, KL divergence %6.4f, 50 iterations in %.4f sec" % (
                     iteration + 1, error, stop_time - start_time))
